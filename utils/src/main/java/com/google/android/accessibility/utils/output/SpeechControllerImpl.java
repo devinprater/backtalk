@@ -79,6 +79,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.function.Function;
@@ -140,9 +141,6 @@ public class SpeechControllerImpl implements SpeechController {
    */
   private static final long SAVED_FEEDBACK_FOR_PAUSE_TIME = 800;
 
-  /** Reusable map used for passing parameters to the TextToSpeech. */
-  private final HashMap<String, String> mSpeechParametersMap = new HashMap<>();
-
   /**
    * Priority queue of actions to perform before utterances start, ordered by ascending utterance
    * index.
@@ -183,6 +181,9 @@ public class SpeechControllerImpl implements SpeechController {
 
   /** Talkback speech deliberately saved by a caller of saveLastUtterance() */
   private @Nullable FeedbackItem savedUtterance;
+
+  /** Backtalk: the text Backtalk last put on the clipboard, which appending adds to. */
+  private @Nullable CharSequence textCopied;
 
   private final Context mContext;
 
@@ -768,8 +769,28 @@ public class SpeechControllerImpl implements SpeechController {
     return copyUtteranceToClipboard(getLastUtterance(), eventId);
   }
 
+  /** Backtalk: adds the saved speech to what was copied, on a line of its own. */
+  public boolean appendSavedUtteranceToClipboard(EventId eventId) {
+    return copyUtteranceToClipboard(savedUtterance, eventId, /* append= */ true);
+  }
+
+  /** Backtalk: adds the last phrase spoken to what was copied, on a line of its own. */
+  public boolean appendLastUtteranceToClipboard(EventId eventId) {
+    return copyUtteranceToClipboard(getLastUtterance(), eventId, /* append= */ true);
+  }
+
   /** Copies a phrase spoken by TalkBack to clipboard */
   public boolean copyUtteranceToClipboard(FeedbackItem item, EventId eventId) {
+    return copyUtteranceToClipboard(item, eventId, /* append= */ false);
+  }
+
+  /**
+   * Copies a phrase spoken by TalkBack to clipboard, or with {@code append}, adds it after what
+   * was copied. From Android 10, only the app in front can read the clipboard, so what was copied
+   * is the text Backtalk last put there.
+   */
+  private boolean copyUtteranceToClipboard(
+      @Nullable FeedbackItem item, EventId eventId, boolean append) {
     if (item == null) {
       return false;
     }
@@ -785,8 +806,21 @@ public class SpeechControllerImpl implements SpeechController {
 
     final ClipboardManager clipboard =
         (ClipboardManager) mContext.getSystemService(Context.CLIPBOARD_SERVICE);
+    CharSequence added = copyableText;
+    if (append) {
+      CharSequence before = textCopied;
+      if (FeatureSupport.supportReadClipboard()) {
+        ClipData current = clipboard.getPrimaryClip();
+        before =
+            (current != null && current.getItemCount() > 0) ? current.getItemAt(0).getText() : null;
+      }
+      if (!TextUtils.isEmpty(before)) {
+        copyableText = TextUtils.concat(before, "\n", copyableText);
+      }
+    }
     ClipData clip = ClipData.newPlainText(null, copyableText);
     clipboard.setPrimaryClip(clip);
+    textCopied = copyableText;
 
     // Verify that we actually have the utterance on the clipboard
     if (FeatureSupport.supportReadClipboard()) {
@@ -794,8 +828,10 @@ public class SpeechControllerImpl implements SpeechController {
     }
     if (clip != null && clip.getItemCount() > 0 && clip.getItemAt(0).getText() != null) {
       speak(
-          mContext.getString(
-              R.string.template_text_copied, clip.getItemAt(0).getText().toString()) /* text */,
+          append
+              ? mContext.getString(R.string.template_text_appended, added.toString())
+              : mContext.getString(
+                  R.string.template_text_copied, clip.getItemAt(0).getText().toString()),
           QUEUE_MODE_INTERRUPT /* queue mode */,
           0 /* flags */,
           null /* speech params */,
@@ -1570,7 +1606,7 @@ public class SpeechControllerImpl implements SpeechController {
       accumulatedUtterance = peekNextUtteranceId();
     } else {
       String utteranceId = currentFeedbackItem.getUtteranceId();
-      if (utteranceId.startsWith(UTTERANCE_ID_PREFIX)) {
+      if (utteranceId != null && utteranceId.startsWith(UTTERANCE_ID_PREFIX)) {
         accumulatedUtterance =
             Integer.parseInt(utteranceId.substring(UTTERANCE_ID_PREFIX.length()));
       } else {
@@ -2071,9 +2107,7 @@ public class SpeechControllerImpl implements SpeechController {
       playHapticsFromFragment(fragment, eventId);
     }
 
-    // Reuse the global instance of speech parameters.
-    final HashMap<String, String> params = mSpeechParametersMap;
-    params.clear();
+    final HashMap<String, String> params = new HashMap<>();
 
     // Add all custom speech parameters.
     final Bundle speechParams = fragment.getSpeechParams();
@@ -2230,9 +2264,9 @@ public class SpeechControllerImpl implements SpeechController {
   /**
    * @return The utterance ID, or -1 if the ID is invalid.
    */
-  private static int parseUtteranceId(String utteranceId) {
+  private static int parseUtteranceId(@Nullable String utteranceId) {
     // Check for bad utterance ID. This should never happen.
-    if (!utteranceId.startsWith(UTTERANCE_ID_PREFIX)) {
+    if (utteranceId == null || !utteranceId.startsWith(UTTERANCE_ID_PREFIX)) {
       LogUtils.e(TAG, "Bad utterance ID: %s", utteranceId);
       return -1;
     }
@@ -2515,14 +2549,15 @@ public class SpeechControllerImpl implements SpeechController {
 
     final int utteranceIndex = SpeechControllerImpl.parseUtteranceId(utteranceId);
     final boolean interrupted =
-        (currentFeedbackItem != null) && !currentFeedbackItem.getUtteranceId().equals(utteranceId);
+        (currentFeedbackItem != null)
+            && !Objects.equals(currentFeedbackItem.getUtteranceId(), utteranceId);
 
     final int status;
     if (interrupted) {
       status = STATUS_INTERRUPTED;
     } else if (requestPause
         && savedFeedbackItem != null
-        && utteranceId.equals(savedFeedbackItem.getUtteranceId())) {
+        && Objects.equals(utteranceId, savedFeedbackItem.getUtteranceId())) {
       status = STATUS_PAUSE;
     } else if (success) {
       status = STATUS_SPOKEN;
